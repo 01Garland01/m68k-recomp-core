@@ -319,7 +319,7 @@ M68kStepResult m68k_step_execute_flow_span(M68kStepContext *c,const M68kStepFlow
 {return execute_flow_span(c,span,budget,0);}
 M68kStepResult m68k_step_execute_validated_flow_span(M68kStepContext *c,const M68kStepFlowSpan *span,uint64_t budget)
 {return execute_flow_span(c,span,budget,1);}
-static M68kStepResult execute_operation(M68kStepContext *c,const M68kStepEntry *entry,M68kStepOperation operation,int tracked)
+static M68kStepResult execute_operation(M68kStepContext *c,const M68kStepEntry *entry,M68kStepOperation operation,int tracked,int verified)
 {
     if(c->fault_escape)return M68K_STEP_REENTERED;
     if(c->state.fault)return (M68kStepResult)c->state.fault;
@@ -335,7 +335,7 @@ static M68kStepResult execute_operation(M68kStepContext *c,const M68kStepEntry *
         return (M68kStepResult)c->state.fault;
     }
     uint32_t pc=c->state.regs.PC;
-    if(entry) {
+    if(entry && !verified) {
         size_t bytes=(size_t)entry->word_count*2u;
         const uint8_t *span=c->code_span && !(pc&1u) && pc<=0xffffffu && bytes<=0x1000000u-pc?
             c->code_span(c->user,pc,bytes):NULL;
@@ -361,11 +361,13 @@ static M68kStepResult execute_operation(M68kStepContext *c,const M68kStepEntry *
     return M68K_STEP_OK;
 }
 M68kStepResult m68k_step_execute(M68kStepContext *c,const M68kStepEntry *entry)
-{return execute_operation(c,entry,entry?entry->execute:NULL,0);}
+{return execute_operation(c,entry,entry?entry->execute:NULL,0,0);}
 M68kStepResult m68k_step_execute_tracked(M68kStepContext *c,const M68kStepEntry *entry)
-{return execute_operation(c,entry,entry?entry->execute:NULL,1);}
+{return execute_operation(c,entry,entry?entry->execute:NULL,1,0);}
 M68kStepResult m68k_step_execute_live(M68kStepContext *c,M68kStepOperation operation)
-{return execute_operation(c,NULL,operation,0);}
+{return execute_operation(c,NULL,operation,0,0);}
+M68kStepResult m68k_step_execute_validated(M68kStepContext *c,const M68kStepEntry *entry,int tracked)
+{return execute_operation(c,entry,entry?entry->execute:NULL,tracked,1);}
 void m68k_step_unimplemented(M68kStepContext *c)
 {fault(c,M68K_STEP_UNSUPPORTED,c->state.instruction_pc);}
 

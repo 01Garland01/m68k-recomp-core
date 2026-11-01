@@ -180,12 +180,14 @@ M68kStepResult m68k_step_execute_flow_span(M68kStepContext *,const M68kStepFlowS
 #define M68K_STEP_HAS_FLOW_SPANS 1
 /* Exclusive code-interval entry points. The owner must have successfully
  * checked this EXACT immutable descriptor through the ordinary entry point in
- * the same exclusive interval. No code byte/mapping/descriptor writer, device
- * observer, opaque callback or external execution may occur before reuse.
- * Expire every proof before any such boundary, including import/restore.
- * These functions retain metadata, PC, budget, IRQ/trace/reentry/fault checks;
+ * the same owner-qualified immutable-code lease. No byte, mapping or
+ * descriptor writer may intervene. A lease may cross only observers/other
+ * masters independently known not to mutate its code. Expire before unknown
+ * callbacks, rebind/import/restore and every return to the unqualified owner.
+ * These functions retain metadata, PC, budget, trace/reentry/fault checks;
  * only the already-proved opcode/extension comparison is omitted. Arbitrary
  * operations and unqualified owners MUST keep the ordinary live guards. */
+M68kStepResult m68k_step_execute_validated(M68kStepContext *,const M68kStepEntry *,int tracked);
 M68kStepResult m68k_step_execute_validated_register(M68kStepContext *,const M68kStepEntry *);
 M68kStepResult m68k_step_execute_validated_span(M68kStepContext *,const M68kStepRegisterSpan *,uint64_t);
 M68kStepResult m68k_step_execute_validated_flow_span(M68kStepContext *,const M68kStepFlowSpan *,uint64_t);
