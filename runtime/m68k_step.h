@@ -97,7 +97,8 @@ typedef struct {
 } M68kStepEntry;
 
 /* Entries are strictly increasing by guest PC. Image identity is diagnostic;
- * execution always checks current mapped opcode AND extension bytes. */
+ * ordinary execution checks current mapped opcode AND extension bytes. Only
+ * the explicit exclusive-interval API below may reuse an earlier proof. */
 typedef struct {
     const char *name;
     uint32_t image_base, image_size, image_crc32;
@@ -177,6 +178,18 @@ M68kStepResult m68k_step_execute_span(M68kStepContext *,const M68kStepRegisterSp
 typedef M68kStepRegisterSpan M68kStepFlowSpan;
 M68kStepResult m68k_step_execute_flow_span(M68kStepContext *,const M68kStepFlowSpan *,uint64_t cycle_budget);
 #define M68K_STEP_HAS_FLOW_SPANS 1
+/* Exclusive code-interval entry points. The owner must have successfully
+ * checked this EXACT immutable descriptor through the ordinary entry point in
+ * the same exclusive interval. No code byte/mapping/descriptor writer, device
+ * observer, opaque callback or external execution may occur before reuse.
+ * Expire every proof before any such boundary, including import/restore.
+ * These functions retain metadata, PC, budget, IRQ/trace/reentry/fault checks;
+ * only the already-proved opcode/extension comparison is omitted. Arbitrary
+ * operations and unqualified owners MUST keep the ordinary live guards. */
+M68kStepResult m68k_step_execute_validated_register(M68kStepContext *,const M68kStepEntry *);
+M68kStepResult m68k_step_execute_validated_span(M68kStepContext *,const M68kStepRegisterSpan *,uint64_t);
+M68kStepResult m68k_step_execute_validated_flow_span(M68kStepContext *,const M68kStepFlowSpan *,uint64_t);
+#define M68K_STEP_HAS_CODE_INTERVALS 1
 /* Runtime correctness floors use the same exception/WAIT/trace boundary.
  * The callback decodes current bytes and sets PC/charge; no stale entry or
  * process-global CPU binding is used. Unsupported semantics must halt. */

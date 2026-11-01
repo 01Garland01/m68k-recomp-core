@@ -219,7 +219,7 @@ int m68k_step_interrupt(M68kStepContext *c,unsigned level)
     return 1;
 }
 
-M68kStepResult m68k_step_execute_register(M68kStepContext *c,const M68kStepEntry *entry)
+static M68kStepResult execute_register(M68kStepContext *c,const M68kStepEntry *entry,int verified)
 {
     if(c->fault_escape)return M68K_STEP_REENTERED;
     if(c->state.fault)return (M68kStepResult)c->state.fault;
@@ -229,10 +229,12 @@ M68kStepResult m68k_step_execute_register(M68kStepContext *c,const M68kStepEntry
        (c->state.regs.SR&T))return M68K_STEP_MISS;
     uint32_t pc=entry->pc;size_t bytes=(size_t)entry->word_count*2u;
     if((pc&1u)||pc>0xffffffu||bytes>0x1000000u-pc)return M68K_STEP_MISS;
-    const uint8_t *span=c->code_span(c->user,pc,bytes);
-    if(!span)return M68K_STEP_MISS;
-    for(unsigned n=0;n<entry->word_count;++n)
-        if((((uint32_t)span[n*2u]<<8)|span[n*2u+1u])!=entry->words[n])return M68K_STEP_MISS;
+    if(!verified) {
+        const uint8_t *span=c->code_span(c->user,pc,bytes);
+        if(!span)return M68K_STEP_MISS;
+        for(unsigned n=0;n<entry->word_count;++n)
+            if((((uint32_t)span[n*2u]<<8)|span[n*2u+1u])!=entry->words[n])return M68K_STEP_MISS;
+    }
     c->state.instruction_pc=pc;c->state.fault_opcode=entry->words[0];
     c->state.exception_vector=0;c->charge=entry->cycles;
     c->state.regs.PC=(pc+(uint32_t)bytes)&0xffffffu;
@@ -240,7 +242,11 @@ M68kStepResult m68k_step_execute_register(M68kStepContext *c,const M68kStepEntry
     c->state.cycles+=c->charge;++c->state.instructions;
     return M68K_STEP_OK;
 }
-M68kStepResult m68k_step_execute_span(M68kStepContext *c,const M68kStepRegisterSpan *span,uint64_t budget)
+M68kStepResult m68k_step_execute_register(M68kStepContext *c,const M68kStepEntry *entry)
+{return execute_register(c,entry,0);}
+M68kStepResult m68k_step_execute_validated_register(M68kStepContext *c,const M68kStepEntry *entry)
+{return execute_register(c,entry,1);}
+static M68kStepResult execute_span(M68kStepContext *c,const M68kStepRegisterSpan *span,uint64_t budget,int verified)
 {
     if(c->fault_escape)return M68K_STEP_REENTERED;
     if(c->state.fault)return (M68kStepResult)c->state.fault;
@@ -257,11 +263,13 @@ M68kStepResult m68k_step_execute_span(M68kStepContext *c,const M68kStepRegisterS
         total+=e->cycles;next+=(unsigned)e->word_count*2u;
     }
     if(total!=span->cycles)return M68K_STEP_MISS;
-    const uint8_t *bytes=c->code_span(c->user,pc,next-pc);if(!bytes)return M68K_STEP_MISS;
-    for(unsigned n=0;n<span->count;++n) {
-        const M68kStepEntry *e=span->entries[n];unsigned offset=e->pc-pc;
-        for(unsigned w=0;w<e->word_count;++w,offset+=2u)
-            if((((unsigned)bytes[offset]<<8)|bytes[offset+1u])!=e->words[w])return M68K_STEP_MISS;
+    if(!verified) {
+        const uint8_t *bytes=c->code_span(c->user,pc,next-pc);if(!bytes)return M68K_STEP_MISS;
+        for(unsigned n=0;n<span->count;++n) {
+            const M68kStepEntry *e=span->entries[n];unsigned offset=e->pc-pc;
+            for(unsigned w=0;w<e->word_count;++w,offset+=2u)
+                if((((unsigned)bytes[offset]<<8)|bytes[offset+1u])!=e->words[w])return M68K_STEP_MISS;
+        }
     }
     span->execute(c);
     const M68kStepEntry *last=span->entries[span->count-1u];
@@ -270,7 +278,11 @@ M68kStepResult m68k_step_execute_span(M68kStepContext *c,const M68kStepRegisterS
     c->state.cycles+=span->cycles;c->state.instructions+=span->count;
     return M68K_STEP_OK;
 }
-M68kStepResult m68k_step_execute_flow_span(M68kStepContext *c,const M68kStepFlowSpan *span,uint64_t budget)
+M68kStepResult m68k_step_execute_span(M68kStepContext *c,const M68kStepRegisterSpan *span,uint64_t budget)
+{return execute_span(c,span,budget,0);}
+M68kStepResult m68k_step_execute_validated_span(M68kStepContext *c,const M68kStepRegisterSpan *span,uint64_t budget)
+{return execute_span(c,span,budget,1);}
+static M68kStepResult execute_flow_span(M68kStepContext *c,const M68kStepFlowSpan *span,uint64_t budget,int verified)
 {
     if(c->fault_escape)return M68K_STEP_REENTERED;
     if(c->state.fault)return (M68kStepResult)c->state.fault;
@@ -287,11 +299,13 @@ M68kStepResult m68k_step_execute_flow_span(M68kStepContext *c,const M68kStepFlow
         total+=e->cycles;next+=(unsigned)e->word_count*2u;
     }
     if(total>span->cycles)return M68K_STEP_MISS;
-    const uint8_t *bytes=c->code_span(c->user,pc,next-pc);if(!bytes)return M68K_STEP_MISS;
-    for(unsigned n=0;n<span->count;++n) {
-        const M68kStepEntry *e=span->entries[n];unsigned offset=e->pc-pc;
-        for(unsigned w=0;w<e->word_count;++w,offset+=2u)
-            if((((unsigned)bytes[offset]<<8)|bytes[offset+1u])!=e->words[w])return M68K_STEP_MISS;
+    if(!verified) {
+        const uint8_t *bytes=c->code_span(c->user,pc,next-pc);if(!bytes)return M68K_STEP_MISS;
+        for(unsigned n=0;n<span->count;++n) {
+            const M68kStepEntry *e=span->entries[n];unsigned offset=e->pc-pc;
+            for(unsigned w=0;w<e->word_count;++w,offset+=2u)
+                if((((unsigned)bytes[offset]<<8)|bytes[offset+1u])!=e->words[w])return M68K_STEP_MISS;
+        }
     }
     const M68kStepEntry *last=span->entries[span->count-1u];
     unsigned prefix=total-last->cycles;
@@ -301,6 +315,10 @@ M68kStepResult m68k_step_execute_flow_span(M68kStepContext *c,const M68kStepFlow
     c->state.cycles+=prefix+c->charge;c->state.instructions+=span->count;
     return M68K_STEP_OK;
 }
+M68kStepResult m68k_step_execute_flow_span(M68kStepContext *c,const M68kStepFlowSpan *span,uint64_t budget)
+{return execute_flow_span(c,span,budget,0);}
+M68kStepResult m68k_step_execute_validated_flow_span(M68kStepContext *c,const M68kStepFlowSpan *span,uint64_t budget)
+{return execute_flow_span(c,span,budget,1);}
 static M68kStepResult execute_operation(M68kStepContext *c,const M68kStepEntry *entry,M68kStepOperation operation,int tracked)
 {
     if(c->fault_escape)return M68K_STEP_REENTERED;
