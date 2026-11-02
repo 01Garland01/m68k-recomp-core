@@ -49,6 +49,13 @@ typedef struct {
     void (*reset_devices)(void *);
 } M68kStepBus;
 
+typedef struct {
+    uint32_t address;
+    size_t bytes;
+    uint8_t *data;
+} M68kStepDataRegion;
+typedef int (*M68kStepDataResolver)(void *,uint32_t,size_t,int,M68kStepDataRegion *);
+
 typedef struct M68kStepContext {
     M68kStepState state;
     M68kStepBus bus;
@@ -63,6 +70,19 @@ typedef struct M68kStepContext {
      * The view is consumed immediately, never cached across instructions.
      * Appended so existing generated operation prefix offsets stay unchanged. */
     const uint8_t *(*code_span)(void *,uint32_t,size_t);
+    /* Optional ordinary-byte memory ownership for independently qualified
+     * context-bus operations. A complete view has one permission and no bus
+     * side effects; it must remain valid until the next bus callback or end
+     * of this operation. Resolver must not reenter, invoke observers or mutate
+     * guest registers, mapping or already-granted permissions.
+     * MMIO, ownership WAIT, ignored writes and noncontiguous storage return0.
+     * These derived views never survive an operation, fault or callback.
+     * Read/write permissions are independent; no instruction guard elision. */
+    M68kStepDataResolver data_region;
+    M68kStepDataRegion data_read,data_write;
+    unsigned data_active;
+    /* Host diagnostic only, never architectural state or a speedup claim. */
+    uint64_t owned_rmw_grants;
 } M68kStepContext;
 #define M68K_STEP_HAS_CODE_SPANS 1
 typedef const uint8_t *(*M68kStepCodeSpan)(void *,uint32_t,size_t);
@@ -77,7 +97,8 @@ typedef struct {
 } M68kStepEntry;
 
 /* Entries are strictly increasing by guest PC. Image identity is diagnostic;
- * execution always checks current mapped opcode AND extension bytes. */
+ * ordinary execution checks current mapped opcode AND extension bytes. Only
+ * the explicit exclusive-interval API below may reuse an earlier proof. */
 typedef struct {
     const char *name;
     uint32_t image_base, image_size, image_crc32;
@@ -85,12 +106,94 @@ typedef struct {
     size_t count;
 } M68kStepModule;
 
+/* Optional immutable parallel REGISTER/TRACKED_BUS flags. Old boolean arrays
+ * remain valid; catalog/operation-object ABI stays unchanged. Zero/absent
+ * means an arbitrary observable callback. */
+typedef struct {
+    const M68kStepModule *module;
+    /* Bit-test REGISTER before execute_register. TRACKED_BUS alone is not
+     * register-pure; never interpret these flags as a nonzero purity bool. */
+    const uint8_t *register_only;
+} M68kStepEffectModule;
+
 void m68k_step_init(M68kStepContext *,const M68kStepBus *,void *user);
 /* Configure between completed operations. The ordinary fetch16 is still
  * required; unsupported ranges always retain the original portable path. */
 int m68k_step_code_span(M68kStepContext *,M68kStepCodeSpan);
+int m68k_step_data_regions(M68kStepContext *,M68kStepDataResolver);
+#define M68K_STEP_HAS_DATA_REGIONS 1
+/* Complete dual-permission ordinary bytes, valid only within the current
+ * managed tracked operation. Resolvers must not mutate guest registers,
+ * mapping or granted permissions, reenter, or invoke observers. A grant stays
+ * stable until a bus callback or operation end. Failure retains ordinary bus
+ * helpers, including missing-callback, alignment, WAIT and partial faults. */
+typedef struct {uint8_t *read,*write;} M68kStepOwnedRmw;
+int m68k_step_owned_rmw(M68kStepContext *,uint32_t,unsigned,M68kStepOwnedRmw *);
+#define M68K_STEP_HAS_OWNED_RMW 1
+static inline uint8_t m68k_step_owned_read8(const M68kStepOwnedRmw*v){return v->read[0];}
+static inline uint16_t m68k_step_owned_read16(const M68kStepOwnedRmw*v)
+{return (uint16_t)(((unsigned)v->read[0]<<8)|v->read[1]);}
+static inline uint32_t m68k_step_owned_read32(const M68kStepOwnedRmw*v)
+{return ((uint32_t)v->read[0]<<24)|((uint32_t)v->read[1]<<16)|((uint32_t)v->read[2]<<8)|v->read[3];}
+static inline void m68k_step_owned_write8(M68kStepOwnedRmw*v,uint8_t x){v->write[0]=x;}
+static inline void m68k_step_owned_write16(M68kStepOwnedRmw*v,uint16_t x)
+{v->write[0]=(uint8_t)(x>>8);v->write[1]=(uint8_t)x;}
+static inline void m68k_step_owned_write32(M68kStepOwnedRmw*v,uint32_t x)
+{v->write[0]=(uint8_t)(x>>24);v->write[1]=(uint8_t)(x>>16);v->write[2]=(uint8_t)(x>>8);v->write[3]=(uint8_t)x;}
 M68kStepResult m68k_step_reset(M68kStepContext *);
 M68kStepResult m68k_step_execute(M68kStepContext *,const M68kStepEntry *);
+/* The caller independently proves all external effects use this context's
+ * bus/state helpers. Arbitrary HLE must use ordinary execute/execute_live.
+ * Only this entry point may reuse optional owned data views. */
+enum { M68K_STEP_EFFECT_REGISTER=1,M68K_STEP_EFFECT_TRACKED_BUS=2 };
+M68kStepResult m68k_step_execute_tracked(M68kStepContext *,const M68kStepEntry *);
+/* A region may use this only for independently qualified operations that
+ * access registers/charge exclusively: no bus, callbacks, exceptions, stopped
+ * state or external storage. Unknown operations retain m68k_step_execute.
+ * A current, side-effect-free code_span is mandatory; MISS makes no change.
+ * Live words, retirement diagnostics and variable charge remain exact. Trace
+ * and reentry always retain the ordinary observable instruction boundary. */
+M68kStepResult m68k_step_execute_register(M68kStepContext *,const M68kStepEntry *);
+#define M68K_STEP_HAS_REGISTER_REGIONS 1
+/* A generated straight-line register-only span. All entries are independently
+ * qualified, fixed-cycle canonical operations in their original lookup order.
+ * execute owns only D/A/CCR and materializes them before returning. Configure
+ * immutable spans between operations; no bus/HLE/control/privilege callbacks.
+ * Caller supplies a conservative cycle budget before ANY CPU/device observer;
+ * full current bytes are checked on every attempt, with no cached identity.
+ */
+enum { M68K_STEP_REGISTER_SPAN_MAX=8 };
+typedef struct {
+    const M68kStepEntry *const *entries;
+    M68kStepOperation execute;
+    unsigned count,cycles;
+} M68kStepRegisterSpan;
+M68kStepResult m68k_step_execute_span(M68kStepContext *,const M68kStepRegisterSpan *,uint64_t cycle_budget);
+#define M68K_STEP_HAS_REGISTER_SPANS 1
+/* Same immutable metadata layout, distinct execution contract: a fixed pure
+ * register prefix ends in one independently proved bus-free control operation.
+ * cycles is the MAXIMUM total charge. execute materializes D/A/CCR, terminal
+ * PC and terminal charge; all prefix charges remain fixed. Current bytes and
+ * the caller's exact no-observer budget still guard every attempt. */
+typedef M68kStepRegisterSpan M68kStepFlowSpan;
+M68kStepResult m68k_step_execute_flow_span(M68kStepContext *,const M68kStepFlowSpan *,uint64_t cycle_budget);
+#define M68K_STEP_HAS_FLOW_SPANS 1
+/* Exclusive code-interval entry points. The owner must have successfully
+ * checked this EXACT immutable descriptor through the ordinary entry point in
+ * the same owner-qualified immutable-code lease, whose byte reads are proved
+ * nonfaulting and side-effect free. No byte, mapping or
+ * descriptor writer may intervene. A lease may cross only observers/other
+ * masters independently known not to mutate its code. Expire before unknown
+ * callbacks, rebind/import/restore and every return to the unqualified owner.
+ * These functions retain metadata, PC, budget, trace/reentry/fault checks;
+ * only the already-proved opcode/extension comparison is omitted. Arbitrary
+ * operations and unqualified owners MUST keep the ordinary live guards.
+ * tracked also requires the original context-bus operation qualification. */
+M68kStepResult m68k_step_execute_validated(M68kStepContext *,const M68kStepEntry *,int tracked);
+M68kStepResult m68k_step_execute_validated_register(M68kStepContext *,const M68kStepEntry *);
+M68kStepResult m68k_step_execute_validated_span(M68kStepContext *,const M68kStepRegisterSpan *,uint64_t);
+M68kStepResult m68k_step_execute_validated_flow_span(M68kStepContext *,const M68kStepFlowSpan *,uint64_t);
+#define M68K_STEP_HAS_CODE_INTERVALS 1
 /* Runtime correctness floors use the same exception/WAIT/trace boundary.
  * The callback decodes current bytes and sets PC/charge; no stale entry or
  * process-global CPU binding is used. Unsupported semantics must halt. */
