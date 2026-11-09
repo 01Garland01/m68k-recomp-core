@@ -239,6 +239,7 @@ static const char *size_read_fn(M68KSize sz) {
  * native and oracle targets). When false, emission is byte-for-byte
  * identical to the pre-Tier-1 baseline. */
 static bool s_reverse_debug = false;
+static bool s_cycle_drift_correction = false;
 /* Set by codegen_emit so emit_instr can probe the offset-table pattern
  * without dragging the whole GameConfig into every emit signature. */
 static const uint32_t *s_extra_seeds      = NULL;
@@ -357,6 +358,112 @@ void codegen_set_dump_functions_path(const char *path) {
  * emit_instr signature stays unchanged.
  */
 static bool g_yield_in_next_bne = false;
+
+/* "PEA-then-RTS tail redirect" idiom: some Genesis code (Golden Axe's entity
+ * system, at least) saves a code-size/style JSR+RTS by instead doing
+ * `pea (SharedEpilogue).l; ...; rts` as the LITERAL FIRST instruction of a
+ * function: the pushed constant becomes the return address `rts` pops, so
+ * on real hardware the function "returns into" SharedEpilogue instead of
+ * its own true caller — SharedEpilogue does its own work and its own `rts`
+ * completes the return to the ORIGINAL caller. e.g. Golden Axe's
+ * UpdateActiveEntities ($B954) tail-redirects into AllocateEntitySprites
+ * ($B7F8) this way; entity self-removal handlers redirect into RemoveEntity
+ * ($B70E) the same way.
+ *
+ * Our recompiler's normal RTS codegen is a flat `return;` (relies on the
+ * emulated 68K call graph mirroring the native C call stack via direct
+ * JSR->C-call / RTS->C-return, which is correct for the overwhelming
+ * majority of code and far cheaper than verifying the popped return
+ * address on every RTS). That flat model silently drops this idiom: the
+ * PEA's target is written into emulated memory as data but never acted on,
+ * so SharedEpilogue never runs.
+ *
+ * Fix: when a function's FIRST instruction is `pea (ABS).l`, don't push it
+ * as data at all — remember ABS as this function's tail-redirect target and
+ * emit `recomp_tail_call(ABS); return;` at every plain RTS reached while
+ * compiling this same function, instead of a bare `return;`. This is exact
+ * (not a heuristic risk) for the pattern it matches: the pushed longword
+ * sits untouched on the emulated stack until some RTS in this function pops
+ * it, on any hardware, regardless of which internal path got there — so
+ * redirecting every one of this function's own top-level RTS instructions
+ * is equivalent to interpreting the real 68K stack. It cannot mis-fire on
+ * unrelated code: PEA elsewhere (mid-function, building a parameter list
+ * for a nearby JSR that consumes it) never occurs at `addr == func_addr`.
+ *
+ * CAVEAT (found the hard way, Golden Axe `func_00707C`): "this function's
+ * first instruction is `pea (ABS).l`" is NOT by itself evidence that the
+ * ORIGINAL 68K code was the simple "pea then immediately rts" idiom this
+ * comment describes. This function boundary is a static-analysis artifact
+ * — `func_00707C`'s entry address is also a branch target from elsewhere
+ * in what was originally one larger function, and that has nothing to do
+ * with whether the code starting there happens to look like this idiom.
+ * `func_00707C`'s actual body branches into further direction checks and
+ * exits via `recomp_tail_call()` on every path — it never reaches an
+ * `MN_RTS` of its own at all, so the check-code below (which only gets
+ * emitted alongside an actual RTS translation) never runs, and the
+ * intended redirect is silently dropped. See `g_func_reaches_own_rts`
+ * below: a cheap look-ahead over the function's already-scanned
+ * instruction list, computed once before codegen for that function
+ * begins, lets the PEA emitter fall back to the generic
+ * `g_pea_redirect_stack` mechanism ONLY for functions that actually need
+ * it (never reach their own RTS), leaving the fast/simple path below
+ * unchanged for the common case it was designed for. */
+static uint32_t g_func_tail_redirect = 0;
+/* Whether the function currently being compiled reaches an `MN_RTS` of
+ * its own on ANY decoded path, computed once per function from its
+ * already-scanned instruction list (see the loop that sets this, right
+ * after `scan_function`/`addrset_sort` for each function). Used only to
+ * decide, in `MN_PEA`'s "own first instruction" special case, whether the
+ * classic `g_func_tail_redirect`-only fast path is safe (this function
+ * WILL reach an RTS that consults it) or whether the redirect needs the
+ * generic runtime-stack fallback instead (this function never does). See
+ * the CAVEAT above `g_func_tail_redirect`. */
+static bool g_func_reaches_own_rts = false;
+
+/* "Nested PEA-then-RTS redirect" — the general form of the idiom above.
+ * Golden Axe's `loc_6FE0` (the joypad-read-and-move handler) does
+ * `pea (ABS).l` repeatedly *inside* its own body, not just as its opening
+ * instruction, and some of those pushes are cancelled on other paths via
+ * `addq.l #4,a7` before ever reaching an RTS. Worse, the RTS that actually
+ * pops a given push is often in a DIFFERENT, shared tail function reached
+ * via a plain branch/tail-call from several different callers with
+ * different redirect targets pending (e.g. `loc_74E0`, called both via a
+ * genuine `bsr` — expects a normal return — and via `bra.w` from sibling
+ * code with a redirect still outstanding — expects its RTS to honor it).
+ * g_func_tail_redirect can't express this: it's one value, function-local.
+ *
+ * Fix: track pending targets on a small RUNTIME stack (g_pea_redirect_depth /
+ * g_pea_redirect_stack, declared in the generated decls header) instead of
+ * compile-time codegen state. Every function, on entry, snapshots the
+ * current depth into a local `_pea_entry_depth`. A mid-function
+ * `pea (ABS).l` pushes ABS onto the runtime stack. A literal stack
+ * deallocation that provably discards N longwords (`addq.l/adda.l #N,a7`,
+ * `move(a).l (sp)+,...`, `movem.l (sp)+,...`) pops up to N tracked entries
+ * back off — clamped to this function's own entry depth, so it can never
+ * cancel an outstanding push that belongs to an ancestor. Every RTS checks
+ * `g_pea_redirect_depth > _pea_entry_depth`: if this function's own body
+ * grew the stack net of its own entry, the RTS pops the top target and
+ * tail-calls it instead of returning; otherwise it returns exactly as
+ * before.
+ *
+ * This composes correctly across both call styles used above without extra
+ * plumbing: a genuine `bsr`/`jsr` is compiled as recomp_call_func(), which
+ * establishes its own tail-call frame — the callee's own entry snapshot
+ * absorbs whatever was already pending, so an unrelated RTS inside it
+ * can't misfire on an ancestor's redirect. A branch/tail-call to a
+ * function outside the current instruction set is compiled as
+ * recomp_tail_call()+return (see emit_split_tail_call) — a trampoline, not
+ * a nested call — so it reuses the SAME enclosing frame and the global
+ * depth counter carries forward untouched, exactly mirroring what
+ * g_split_sp_popped already does for the unrelated addq-skip-return idiom.
+ * recomp_tail_call() itself never recurses (it just marks a pending
+ * address and returns; the nearest recomp_call_func/recomp_dispatch_once
+ * loop redispatches), so redirecting through it here carries none of the
+ * native-stack-overflow risk the earlier blanket bra.w-trampoline
+ * generalization had. Restricted to literal `pea (ABS).l` (absolute-long,
+ * compile-time-constant target) exactly like g_func_tail_redirect, so it
+ * cannot misfire on a computed PEA (e.g. `pea (a0)`) building a JSR
+ * parameter list. */
 
 static const char *size_write_fn(M68KSize sz) {
     switch (sz) {
@@ -1600,6 +1707,43 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
                 }
                 break;
 
+            case MN_PEA:
+                /* See the nested PEA-then-RTS redirect comment above
+                 * g_func_tail_redirect / g_pea_redirect_depth in this file.
+                 * `pea (ABS).l` (absolute-long — a compile-time-constant
+                 * target, never a computed address) is either building a
+                 * parameter list for a nearby JSR that pops it as plain
+                 * data, or it is this idiom, where some later RTS (possibly
+                 * in a different, shared function) needs to tail-call ABS.
+                 * The RTS-side redirect can only resolve ABS through
+                 * recomp_tail_call()'s dispatch table, which requires ABS to
+                 * be a real, independently-compiled function — exactly like
+                 * a JSR target. Unlike JSR, this doesn't need "proven"
+                 * evidence gating: an over-promoted entry (the ordinary
+                 * parameter-list case) just compiles one small dead
+                 * function nothing ever calls, caught by the same
+                 * misaligned/interior-entry safety nets as any other
+                 * speculative boundary; an under-promoted one leaves the
+                 * idiom's redirect unresolvable, which is the actual bug. */
+                if (extern_targets) {
+                    /* PEA never sets has_target/target_addr (those are
+                     * populated only by the Bcc/BRA/BSR/JMP/JSR decode
+                     * paths) — absolute-long mode consumes exactly 2
+                     * extension words (high, low) via consume_ea_ext, with
+                     * word_count starting at 1 (opcode only), so they land
+                     * at words[1]/words[2] — same layout JMP/JSR's own
+                     * PCR_ABS_L case reconstructs manually. */
+                    int pea_mode = (instr.src_ea >> 3) & 7;
+                    int pea_reg  =  instr.src_ea       & 7;
+                    if (pea_mode == 7 && pea_reg == 1 && instr.word_count >= 3) {
+                        uint32_t target = ((uint32_t)instr.words[1] << 16) |
+                                          instr.words[2];
+                        addrset_insert(extern_targets, target);
+                    }
+                }
+                break;
+
+
             default:
                 break;
             }
@@ -1880,6 +2024,126 @@ static int estimate_cycles(const M68KInstr *instr)
     return cost;
 }
 
+/* ---- Cycle-drift correction (2026-08-29) ----
+ * The STATIC-STAMP POLICY (see estimate_cycles_prm's header comment) bakes a
+ * fixed cost into the generated C at codegen time for instructions whose real
+ * MC68000 cost depends on runtime state — Bcc/DBcc/BRA/BSR pinned to the
+ * taken cost, Scc to true, register-count shifts to an average of 4. Live
+ * measurement (on Golden Axe) found this drifts the audio/VBlank cycle clock
+ * by ~490 cycles/frame against a ~109,312 cycle/frame VBlank budget — over a
+ * full frame's worth of error within ~220 frames — big enough to shift
+ * exactly which instruction gap a VBlank interrupt lands in relative to real
+ * hardware. That shift was the confirmed root cause of a sprite palette DMA
+ * racing the game's own WRAM writes on Golden Axe's "GO!" prompt (real
+ * hardware never showed the race; see that project's PROGRESS.md for the
+ * full trace).
+ *
+ * Emits a runtime correction for exactly the categories with a
+ * cheaply-computable real cost (Bcc/DBcc/Scc taken-vs-not-taken,
+ * register-count shifts — MULU/MULS/DIVU/DIVS are NOT covered; their real
+ * costs are substantially more involved, and these four categories were the
+ * frequent, high-confidence contributors). The correction is charged into
+ * g_cycle_accumulator/g_audio_cycle_counter — the counters that actually
+ * drive VBlank scheduling and audio timing — guarded by `#ifndef
+ * GENESIS_COSIM` in the GENERATED code (codegen can't branch on a
+ * build-time macro, so the guard has to live in the emitted C): cosim
+ * builds keep the exact static-only behavior they had before this change,
+ * so the recomp-vs-interpreter cycle-clock pairing's existing guarantees
+ * are untouched — only native/oracle builds (the ones that actually run
+ * gameplay and schedule the real VBlank interrupt) get the corrected
+ * timing. A negative correction is clamped so g_cycle_accumulator (a
+ * uint32_t) can never underflow-wrap, relevant only in the first few
+ * instructions after a frame-boundary reset when the accumulator is still
+ * small.
+ *
+ * Called once per instruction from the same call site as
+ * emit_cycle_accounting, right after emit_instr() has already written that
+ * instruction's own body, and only when the game opts in with
+ * `cycle_drift_correction = true` under [game] in game.toml. */
+static int ea_is_reg(int ea)      /* Dn or An */
+{
+    if (ea < 0) return 0;
+    return ((ea >> 3) & 7) <= 1;
+}
+
+static void emit_cycle_drift_correction(FILE *f, const M68KInstr *instr)
+{
+    uint16_t w0 = instr->words[0];
+    const char *corr_expr = NULL;   /* runtime C expression for the signed correction, or NULL */
+    char corr_buf[128];
+
+    switch (instr->mnemonic) {
+    case MN_Bcc: {
+        /* estimate_cycles() charges the TAKEN cost (10) unconditionally
+         * (see the trailing per-instruction charge in the caller, which is
+         * the only charge reached when the branch falls through — Bcc's own
+         * case charges 10 and jumps away on the taken path, never reaching
+         * here). So this line only ever executes on a genuine not-taken
+         * outcome; the real cost for that case is fully known at codegen
+         * time from the displacement form (word-form low byte == 0x00). */
+        int word_form = (w0 & 0xFFu) == 0x00u;
+        int untaken   = word_form ? 12 : 8;
+        snprintf(corr_buf, sizeof corr_buf, "%d", untaken - 10);
+        corr_expr = corr_buf;
+        break;
+    }
+    case MN_DBcc: {
+        /* Reached only on loop exit — either the condition was already true
+         * (real cost 12, counter never decremented) or the counter expired
+         * (real cost 14). Both currently share the flat static 10. Re-derive
+         * which happened via the SAME condition test (SR is unchanged since
+         * MN_DBcc's own case evaluated it, and re-evaluating is side-effect
+         * free). */
+        int cond = (w0 >> 8) & 0xF;
+        const char *ce = bcc_cond_expr(cond);
+        snprintf(corr_buf, sizeof corr_buf, "((%s) ? %d : %d)", ce, 12 - 10, 14 - 10);
+        corr_expr = corr_buf;
+        break;
+    }
+    case MN_Scc: {
+        /* Only the register destination has a true(6)/false(4) split — a
+         * memory destination is a flat 8+ea either way (see
+         * estimate_cycles_prm), so no drift there. */
+        if (ea_is_reg(instr->src_ea)) {
+            int cond = (w0 >> 8) & 0xF;
+            const char *ce = bcc_cond_expr(cond);
+            snprintf(corr_buf, sizeof corr_buf, "((%s) ? 0 : %d)", ce, 4 - 6);
+            corr_expr = corr_buf;
+        }
+        break;
+    }
+    case MN_LSL: case MN_LSR: case MN_ASL: case MN_ASR:
+    case MN_ROL: case MN_ROR: case MN_ROXL: case MN_ROXR: {
+        if (!instr->mem_shift) {
+            int reg_count_mode = (w0 >> 5) & 1;
+            if (reg_count_mode) {
+                /* Static policy assumed an average count of 4; the real
+                 * count is Dn masked to 6 bits (68000 shift-count range). */
+                int dreg = w0 & 7;
+                snprintf(corr_buf, sizeof corr_buf,
+                         "(2*((int)(g_cpu.D[%d] & 63u) - 4))", dreg);
+                corr_expr = corr_buf;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+
+    if (!corr_expr)
+        return;
+
+    fprintf(f,
+        "#ifndef GENESIS_COSIM\n"
+        "  { int32_t _c = %s;\n"
+        "    if (_c < 0 && (uint32_t)(-_c) > g_cycle_accumulator) _c = -(int32_t)g_cycle_accumulator;\n"
+        "    g_cycle_accumulator += (uint32_t)_c; g_audio_cycle_counter += (uint32_t)_c;\n"
+        "    if (g_cycle_accumulator >= g_vblank_threshold) glue_check_vblank(); }\n"
+        "#endif\n",
+        corr_expr);
+}
+
 /* emit_mem_shift — the 68K memory shift/rotate forms (opcode size field == 11,
  * instr->mem_shift set by the decoder). These always shift a single 16-bit
  * memory operand by exactly 1 bit; the destination EA is in src_ea. Emitted as
@@ -2028,7 +2292,43 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "  if (g_split_sp_popped >= 4) { g_rte_pending = g_split_sp_popped / 4; g_split_sp_popped = 0; }\n");
         }
         emit_cycle_accounting(f, "  ", estimate_cycles(instr));
-        fprintf(f, "  return;\n");
+        /* See the nested PEA-then-RTS redirect comment above
+         * g_func_tail_redirect. A mid-function `pea (ABS).l` reached along
+         * THIS function's own dynamic path (possibly a shared tail routine
+         * reached via branch/tail-call, not just the function that pushed
+         * it) takes priority: it's a more specific, real-time signal than
+         * the function-local g_func_tail_redirect, and real hardware pops
+         * whichever address is physically on top of the stack (LIFO) —
+         * a later mid-function push always resolves before an earlier
+         * first-instruction one. */
+        fprintf(f, "  if (g_pea_redirect_depth > _pea_entry_depth) {\n");
+        fprintf(f, "    uint32_t _pea_t = g_pea_redirect_stack[--g_pea_redirect_depth];\n");
+        /* The PEA that staged this redirect did a REAL guest push
+         * (g_cpu.A[7] -= 4; m68k_write32(...) -- see the mid-function PEA
+         * emission). On real hardware this RTS pops that same longword off
+         * the stack (consuming it as its target) before jumping, so A7 must
+         * advance by 4 to match -- otherwise every mid-function PEA-then-RTS
+         * redirect leaks 4 bytes of permanent guest stack depth into
+         * whatever the caller does next. Confirmed via GENESIS_STRICT_JSR_STACK
+         * (goldenaxe loc_23A6 -> loc_23C8: post consistently landed at
+         * slot-4) and traced forward to a real player-control corruption:
+         * a caller's own pushed value (e.g. Player1's a0) ends up one slot
+         * deeper than expected, so a later `movem.l (sp)+,a0` reads a stale
+         * return address instead. */
+        fprintf(f, "    g_cpu.A[7] += 4;\n");
+        fprintf(f, "    recomp_tail_call(_pea_t); return; "
+                   "/* nested PEA-then-RTS redirect */\n");
+        fprintf(f, "  }\n");
+        if (g_func_tail_redirect) {
+            /* See g_func_tail_redirect comment: this function opened with
+             * `pea (ABS).l`, so its RTS pops that pushed address on real
+             * hardware, not a return to its true caller. */
+            fprintf(f, "  recomp_tail_call(0x%06Xu); return; "
+                       "/* PEA-then-RTS tail redirect */\n",
+                    g_func_tail_redirect);
+        } else {
+            fprintf(f, "  return;\n");
+        }
         *skip_until_label = true;
         break;
 
@@ -2608,6 +2908,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             if (dst_ea == ((EA_An_PRE << 3) | 7))
                 fprintf(f, "  _sp_popped -= %d; /* MOVE -(SP) bytes */\n", stack_bytes);
         }
+        if (sz == M68K_SIZE_L && src_ea == ((EA_An_POST << 3) | 7))
+            fprintf(f, "  if (g_pea_redirect_depth > _pea_entry_depth) g_pea_redirect_depth--; "
+                       "/* MOVE.L (SP)+ may consume a pending PEA redirect */\n");
         break;
     }
 
@@ -2625,6 +2928,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 && instr->src_ea == ((EA_An_POST << 3) | 7))
             fprintf(f, "  _sp_popped += %d; /* MOVEA (SP)+ bytes */\n",
                     sz == M68K_SIZE_L ? 4 : 2);
+        if (sz == M68K_SIZE_L && instr->src_ea == ((EA_An_POST << 3) | 7))
+            fprintf(f, "  if (g_pea_redirect_depth > _pea_entry_depth) g_pea_redirect_depth--; "
+                       "/* MOVEA.L (SP)+ may consume a pending PEA redirect */\n");       
         break;
     }
 
@@ -2638,10 +2944,54 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_PEA: {
+         int pea_mode = (instr->src_ea >> 3) & 7;
+        int pea_reg  =  instr->src_ea       & 7;
+        int is_own_first_instr = (addr == func_addr && pea_mode == 7 && pea_reg == 1);
+        if (is_own_first_instr && g_func_reaches_own_rts) {
+            /* `pea (ABS).l` as the function's own first instruction, AND
+             * this function's already-scanned instruction list contains an
+             * MN_RTS of its own (checked once before codegen for this
+             * function began — see g_func_reaches_own_rts): the classic
+             * fast path from the g_func_tail_redirect comment above is
+             * safe here. Don't push it as data — redirect this function's
+             * RTS instructions instead. */
+            emit_ea_addr(f, instr, instr->src_ea, &er, addr_expr);
+            g_func_tail_redirect = (uint32_t)strtoul(addr_expr, NULL, 16);
+            fprintf(f, "  /* PEA-then-RTS tail redirect -> $%06X (see RTS below) */\n",
+                    g_func_tail_redirect);
+            break;
+        }
         emit_ea_addr(f, instr, instr->src_ea, &er, addr_expr);
+         if (is_own_first_instr) {
+            /* Own-first-instruction PEA, but this function's own body
+             * never reaches an MN_RTS on any decoded path (confirmed by
+             * the same pre-scan) — the fast path above would silently
+             * drop the redirect entirely (see the CAVEAT above
+             * g_func_tail_redirect; this is exactly the Golden Axe
+             * `func_00707C` case). Fall through to the generic
+             * mid-function emission below instead, so the redirect
+             * propagates via the runtime stack to whichever function's
+             * RTS actually runs next along the dynamic path. Scoped
+             * strictly to functions that need it — every function that
+             * still takes the fast path above is emitted byte-for-byte
+             * as before. */
+            fprintf(f, "  /* PEA-then-RTS tail redirect target $%06X never "
+                       "reached via this function's own RTS (it has none) "
+                       "-- using the generic redirect stack instead */\n",
+                    (uint32_t)strtoul(addr_expr, NULL, 16));
+        }
         fprintf(f, "  g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], %s);\n", addr_expr);
         if (*has_sp_adjust)
             fprintf(f, "  _sp_popped -= 4; /* PEA pushes one longword */\n");
+        if (pea_mode == 7 && pea_reg == 1) {
+            /* Mid-function `pea (ABS).l` (including the own-first-instruction/
+             * never-reaches-own-RTS case above, now handled here too): see
+             * the nested PEA-then-RTS redirect comment above
+             * g_func_tail_redirect. */
+            fprintf(f, "  if (g_pea_redirect_depth < PEA_REDIRECT_MAX) "
+                       "g_pea_redirect_stack[g_pea_redirect_depth++] = %s; "
+                       "/* nested PEA-then-RTS redirect */\n", addr_expr);
+        }
         break;
     }
 
@@ -2675,6 +3025,11 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             /* Account data releases as well as whole return-slot skips. */
             if (reg == 7 && imm > 0 && *has_sp_adjust) {
                 fprintf(f, "  _sp_popped += %u;\n", imm);
+                fprintf(f, "  { unsigned _n = %u; while (_n-- > 0 && "
+                           "g_pea_redirect_depth > _pea_entry_depth) "
+                           "g_pea_redirect_depth--; } "
+                           "/* addq.l #N,a7 may cancel pending PEA redirect(s) */\n",
+                        imm / 4);
             }
         } else {
             /* RMW: use emit_ea_load_ex with rmw=1 so (An)+ doesn't
@@ -3628,6 +3983,17 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             else if (dir == 0 && mode == 4)
                 fprintf(f, "  _sp_popped -= %d; /* MOVEM -(SP) bytes */\n",
                         reg_count * (sz == M68K_SIZE_L ? 4 : 2));
+        }
+         if (sz == M68K_SIZE_L && reg == 7 && dir == 1 && mode == 3) {
+            int reg_count = 0;
+            for (int bit = 0; bit < 16; bit++)
+                if (mask & (1u << bit))
+                    reg_count++;
+            fprintf(f, "  { unsigned _n = %d; while (_n-- > 0 && "
+                       "g_pea_redirect_depth > _pea_entry_depth) "
+                       "g_pea_redirect_depth--; } "
+                       "/* MOVEM.L (SP)+ may consume pending PEA redirect(s) */\n",
+                    reg_count);
         }
         break;
     }
@@ -4618,6 +4984,18 @@ static void emit_decls_preamble(FILE *f) {
     fprintf(f, " * definition lives in part00; every split TU links against this extern. */\n");
     fprintf(f, "extern int g_split_sp_popped;\n");
     fprintf(f, "\n");
+     fprintf(f, "/* Nested PEA-then-RTS redirect stack: see the comment above\n");
+    fprintf(f, " * g_func_tail_redirect in code_generator.c. Unlike that mechanism\n");
+    fprintf(f, " * (one compile-time-known target per function, function-local), this\n");
+    fprintf(f, " * tracks arbitrarily many `pea (ABS).l` targets pushed mid-function\n");
+    fprintf(f, " * at runtime, because the target and the RTS that ultimately consumes\n");
+    fprintf(f, " * it can live in different, conditionally-reached (possibly shared)\n");
+    fprintf(f, " * functions. One file-scope definition lives in part00; every split\n");
+    fprintf(f, " * TU links against this extern. */\n");
+    fprintf(f, "#define PEA_REDIRECT_MAX 32\n");
+    fprintf(f, "extern int g_pea_redirect_depth;\n");
+    fprintf(f, "extern uint32_t g_pea_redirect_stack[PEA_REDIRECT_MAX];\n");
+    fprintf(f, "\n");
 }
 
 /* =========================================================================
@@ -4770,6 +5148,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                   const AnnotationTable *at, const GameConfig *cfg,
                   bool reverse_debug) {
     s_reverse_debug = reverse_debug;
+    s_cycle_drift_correction = cfg && cfg->cycle_drift_correction;
+    if (s_cycle_drift_correction)
+        printf("[Codegen] cycle-drift correction enabled\n");
     free(s_candidate_owners);
     s_candidate_owners = NULL;
     s_candidate_owner_count = 0;
@@ -4827,7 +5208,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             fprintf(f_parts[k],
                 "/* The one file-scope definition for the extern declared in\n"
                 " * %s_decls.h — every other split TU links against this. */\n"
-                "int g_split_sp_popped = 0; /* signed guest stack delta in bytes */\n\n", prefix);
+                 "int g_split_sp_popped = 0;\n"
+                "int g_pea_redirect_depth = 0;\n"
+                "uint32_t g_pea_redirect_stack[PEA_REDIRECT_MAX];\n\n", prefix);
         }
     }
 
@@ -5038,6 +5421,23 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         /* Sort instruction addresses */
         addrset_sort(&instrs);
 
+         /* Does this function reach an MN_RTS of its own on any decoded
+         * path? See g_func_reaches_own_rts / the CAVEAT above
+         * g_func_tail_redirect: MN_PEA's "own first instruction" special
+         * case needs this to know whether its fast path (relying on an
+         * RTS within THIS function to consult g_func_tail_redirect) is
+         * actually reachable, or whether it must fall back to the generic
+         * runtime-stack redirect instead. Cheap: instrs is already fully
+         * scanned and sorted above; this just decodes each address once
+         * more (same as the interior-dispatch pre-pass below already
+         * does) checking the mnemonic. */
+        g_func_reaches_own_rts = false;
+        for (int j = 0; j < instrs.count; j++) {
+            M68KInstr rts_probe;
+            if (!m68k_decode(rom, instrs.addrs[j], &rts_probe)) continue;
+            if (rts_probe.mnemonic == MN_RTS) { g_func_reaches_own_rts = true; break; }
+        }
+
         /* Interior-dispatch pre-pass: any JMP (d8,PC,Xn) inside this function
          * whose targets land on in-function instructions needs `label_XXXXXX:;`
          * at each landing point so the MN_JMP emitter can emit a switch + goto
@@ -5105,6 +5505,12 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                     func_addr);
         else
             fprintf(f_func, "void func_%06X(void) {\n", func_addr);
+            /* See the nested PEA-then-RTS redirect comment above
+            * g_func_tail_redirect: every function snapshots the current
+            * redirect-stack depth on entry so its own RTS sites can tell
+            * "I pushed something outstanding" (depth grew) apart from "an
+            * ancestor still has something pending" (depth unchanged). */
+            fprintf(f_func, "  int _pea_entry_depth = g_pea_redirect_depth;\n");
         if (s_reverse_debug) {
             if (has_aliases) {
                 fprintf(f_func, "  g_rdb_current_func = _entry;\n");
@@ -5253,6 +5659,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         }
 
         bool skip_until_label = false;
+        g_func_tail_redirect = 0;   /* per-function; see PEA/RTS handlers */
         uint32_t register_span_end = 0;
 
         for (int j = 0; j < instrs.count; j++) {
@@ -5323,8 +5730,14 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
              * Examples:
              *   Sonic 2 BuildSprites_P2 ($016A7A):
              *       tst.w (Hint_flag).w
-             *       bne.s BuildSprites_P2 */
-            if (j + 1 < instrs.count && instr.mnemonic == MN_TST) {
+             *       bne.s BuildSprites_P2
+             *   Golden Axe loc_DA8 ($000DAA, called after a work-request
+             *   byte store the plain 4-instruction WaitForVBlank pattern
+             *   can't absorb without dropping the store):
+             *       move.b  $FFFFC183.w, d0
+             *       bne.s   loc_DAA           ; self */
+            if (j + 1 < instrs.count &&
+                instr.mnemonic == MN_TST) {
                 M68KInstr next;
                 if (m68k_decode(rom, instrs.addrs[j + 1], &next) &&
                     next.mnemonic == MN_Bcc &&
@@ -5349,6 +5762,8 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
             {
                 int cyc = estimate_cycles(&instr);
                 emit_cycle_accounting(f_func, "  ", cyc);
+                if (s_cycle_drift_correction)
+                    emit_cycle_drift_correction(f_func, &instr);
             }
 
             /* Two valid entry streams can overlap in ROM. Sorted emission
@@ -5535,6 +5950,16 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     }
 
     fprintf(f_dispatch,
+        "/* See the nested PEA-then-RTS redirect comment above\n"
+        " * g_pea_redirect_depth in the generated decls header (and above\n"
+        " * g_func_tail_redirect in code_generator.c) for the full picture.\n"
+        " * Declared again here because this dispatch TU doesn't include\n"
+        " * the per-prefix decls header. */\n"
+        "#ifndef PEA_REDIRECT_MAX\n"
+        "#define PEA_REDIRECT_MAX 32\n"
+        "#endif\n"
+        "extern int g_pea_redirect_depth;\n"
+        "extern uint32_t g_pea_redirect_stack[PEA_REDIRECT_MAX];\n\n"
         "#ifdef GENESIS_HAS_NATIVE_CALL_FRAME\n"
         "typedef GenesisNativeCallFrame RecompTailFrame;\n"
         "GenesisNativeCallFrame *g_recomp_native_frame = NULL;\n"
@@ -5610,20 +6035,68 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "    recomp_drain_tailcalls(frame);\n"
         "}\n"
         "#endif\n\n"
+         "/* A callee whose every path tail-calls out (recomp_tail_call),\n"
+        " * never reaching its own plain RTS, can leave a PEA push from ITS\n"
+        " * OWN body still pending here even after recomp_drain_tailcalls\n"
+        " * has fully settled -- nothing downstream ever had an entry-depth\n"
+        " * snapshot low enough to claim it (see the g_pea_redirect_depth\n"
+        " * comment: every tail-called function inherits the ALREADY-\n"
+        " * incremented global depth as its own baseline, by design, so it\n"
+        " * correctly never fires for a push it didn't make itself). Real\n"
+        " * 68K hardware would have that value sitting on the real stack for\n"
+        " * THIS call's own RTS to eventually pop; our RTS is a native C\n"
+        " * return with no such stack, so this call boundary -- the one\n"
+        " * point that actually corresponds to \"this JSR is returning\" --\n"
+        " * is where it must be resolved instead: dispatch it as one more\n"
+        " * tail-call and drain again, repeating until the depth is back to\n"
+        " * what it was when this call began (or a runaway is declared, same\n"
+        " * discipline as recomp_drain_tailcalls' own guard). No-op (loop\n"
+        " * body never runs) for the overwhelmingly common case where\n"
+        " * nothing pending leaked past the ordinary drain. */\n"
+        "static void recomp_drain_pea_boundary(RecompTailFrame *frame, int entry_depth) {\n"
+        "    unsigned guard = 0;\n"
+        "    while (g_pea_redirect_depth > entry_depth) {\n"
+        "        uint32_t addr = g_pea_redirect_stack[--g_pea_redirect_depth];\n"
+        /* Same real-hardware pop this redirect's PEA is owed (see the
+         * mid-function PEA-then-RTS RTS-side comment) -- this callee never
+         * reached its own plain RTS (every path tail-called out instead),
+         * so the pop is settled here at the call boundary instead. Without
+         * it, every leaked redirect resolved here permanently deepens the
+         * guest stack by 4 bytes. */
+        "        g_cpu.A[7] += 4;\n"
+        "        recomp_tail_call(addr);\n"
+        "        recomp_drain_tailcalls(frame);\n"
+        "        if (g_rte_pending)\n"
+        "            break;\n"
+        "        if (++guard > 1000000u) {\n"
+        "            fprintf(stderr, \"PEA-redirect call-boundary drain runaway at $%%06X\\n\", addr);\n"
+        "            exit(2);\n"
+        "        }\n"
+        "    }\n"
+        "}\n\n"
+        "#ifdef GENESIS_HAS_NATIVE_CALL_FRAME\n"
+        "void recomp_native_drain_pea(GenesisNativeCallFrame *frame, int entry_depth) {\n"
+        "    recomp_drain_pea_boundary(frame, entry_depth);\n"
+        "}\n"
+        "#endif\n\n"
         "void recomp_call_func(RecompFuncPtr fn) {\n"
         "    if (!fn)\n"
         "        return;\n"
+        "    int _pea_call_entry_depth = g_pea_redirect_depth;\n"
         "    RecompTailFrame frame = RECOMP_FRAME_INIT;\n"
         "    g_recomp_tail_frame = &frame;\n"
         "    fn();\n"
         "    recomp_drain_tailcalls(&frame);\n"
+        "    recomp_drain_pea_boundary(&frame, _pea_call_entry_depth);\n"
         "    g_recomp_tail_frame = frame.prev;\n"
         "}\n\n"
         "void recomp_call_addr(uint32_t addr) {\n"
+        "    int _pea_call_entry_depth = g_pea_redirect_depth;\n"
         "    RecompTailFrame frame = RECOMP_FRAME_INIT;\n"
         "    g_recomp_tail_frame = &frame;\n"
         "    recomp_tail_call(addr);\n"
         "    recomp_drain_tailcalls(&frame);\n"
+        "    recomp_drain_pea_boundary(&frame, _pea_call_entry_depth);\n"
         "    g_recomp_tail_frame = frame.prev;\n"
         "}\n\n"
         "void call_by_address(uint32_t addr) {\n"
